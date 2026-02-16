@@ -71,6 +71,8 @@ int __bce_vhci_event_queue_create(struct bce_vhci *vhci, struct bce_vhci_event_q
                                   bce_sq_completion compl)
 {
     ret->vhci = vhci;
+    ret->name = name;
+    ret->active = true;
 
     ret->sq = bce_create_sq(vhci->dev, vhci->ev_cq, name, VHCI_EVENT_QUEUE_EL_COUNT, DMA_FROM_DEVICE, compl, ret);
     if (!ret->sq)
@@ -99,9 +101,12 @@ void bce_vhci_event_queue_destroy(struct bce_vhci *vhci, struct bce_vhci_event_q
 {
     if (!q->sq)
         return;
+    q->active = false;
     dma_free_coherent(&vhci->dev->pci->dev, sizeof(struct bce_vhci_message) * VHCI_EVENT_QUEUE_EL_COUNT,
                       q->data, q->dma_addr);
     bce_destroy_sq(vhci->dev, q->sq);
+    q->sq = NULL;
+    q->data = NULL;
 }
 
 static void bce_vhci_event_queue_completion(struct bce_queue_sq *sq)
@@ -112,6 +117,11 @@ static void bce_vhci_event_queue_completion(struct bce_queue_sq *sq)
     size_t cnt = 0;
 
     while ((cd = bce_next_completion(sq))) {
+        if (!ev->active) {
+            pr_debug("bce-vhci: dropping event on inactive queue '%s'\n", ev->name);
+            bce_notify_submission_complete(sq);
+            continue;
+        }
         if (cd->status == BCE_COMPLETION_ABORTED) { /* We flushed the queue */
             bce_notify_submission_complete(sq);
             continue;
@@ -132,9 +142,11 @@ void bce_vhci_event_queue_submit_pending(struct bce_vhci_event_queue *q, size_t 
 {
     int idx;
     struct bce_qe_submission *s;
+    if (!q->active || !q->sq)
+        return;
     while (count--) {
         if (bce_reserve_submission(q->sq, NULL)) {
-            pr_err("bce-vhci: Failed to reserve an event queue submission\n");
+            pr_err("bce-vhci: Failed to reserve an event queue submission (%s)\n", q->name);
             break;
         }
         idx = q->sq->tail;
@@ -148,14 +160,15 @@ void bce_vhci_event_queue_submit_pending(struct bce_vhci_event_queue *q, size_t 
 void bce_vhci_event_queue_pause(struct bce_vhci_event_queue *q)
 {
     unsigned long timeout;
+    q->active = false;
     reinit_completion(&q->queue_empty_completion);
     if (bce_cmd_flush_memory_queue(q->vhci->dev->cmd_cmdq, q->sq->qid))
-        pr_warn("bce-vhci: failed to flush event queue\n");
+        pr_warn("bce-vhci: failed to flush event queue (%s)\n", q->name);
     timeout = msecs_to_jiffies(5000);
     while (atomic_read(&q->sq->available_commands) != q->sq->el_count - 1) {
         timeout = wait_for_completion_timeout(&q->queue_empty_completion, timeout);
         if (timeout == 0) {
-            pr_err("bce-vhci: waiting for queue to be flushed timed out\n");
+            pr_err("bce-vhci: waiting for queue to be flushed timed out (%s)\n", q->name);
             break;
         }
     }
@@ -163,8 +176,9 @@ void bce_vhci_event_queue_pause(struct bce_vhci_event_queue *q)
 
 void bce_vhci_event_queue_resume(struct bce_vhci_event_queue *q)
 {
+    q->active = true;
     if (atomic_read(&q->sq->available_commands) != q->sq->el_count - 1) {
-        pr_err("bce-vhci: resume of a queue with pending submissions\n");
+        pr_err("bce-vhci: resume of queue with pending submissions (%s)\n", q->name);
         return;
     }
     bce_vhci_event_queue_submit_pending(q, VHCI_EVENT_PENDING_COUNT);

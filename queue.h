@@ -54,6 +54,7 @@ struct bce_queue_sq {
 
 struct bce_queue_cmdq_result_el {
     struct completion cmpl;
+    u16 slot;
     u32 status;
     u64 result;
 };

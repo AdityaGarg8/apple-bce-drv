@@ -3,6 +3,7 @@
 #include <linux/version.h>
 
 #define REG_DOORBELL_BASE 0x44000
+#define BCE_CMDQ_WAIT_TIMEOUT_MS 5000
 
 struct bce_queue_cq *bce_alloc_cq(struct apple_bce_device *dev, int qid, u32 el_count)
 {
@@ -250,18 +251,30 @@ static __always_inline void *bce_cmd_start(struct bce_queue_cmdq *cmdq, struct b
         return NULL;
 
     spin_lock(&cmdq->lck);
-    cmdq->tres[cmdq->sq->tail] = res;
+    res->slot = (u16) cmdq->sq->tail;
+    cmdq->tres[res->slot] = res;
     ret = bce_next_submission(cmdq->sq);
     return ret;
 }
 
-static __always_inline void bce_cmd_finish(struct bce_queue_cmdq *cmdq, struct bce_queue_cmdq_result_el *res)
+static __always_inline int bce_cmd_finish(struct bce_queue_cmdq *cmdq, struct bce_queue_cmdq_result_el *res)
 {
+    unsigned long timeout;
+
     bce_submit_to_device(cmdq->sq);
     spin_unlock(&cmdq->lck);
 
-    wait_for_completion(&res->cmpl);
+    timeout = msecs_to_jiffies(BCE_CMDQ_WAIT_TIMEOUT_MS);
+    if (!wait_for_completion_timeout(&res->cmpl, timeout)) {
+        spin_lock(&cmdq->lck);
+        if (cmdq->tres[res->slot] == res)
+            cmdq->tres[res->slot] = NULL;
+        spin_unlock(&cmdq->lck);
+        pr_err("apple-bce: command queue timed out after %u ms\n", BCE_CMDQ_WAIT_TIMEOUT_MS);
+        return -ETIMEDOUT;
+    }
     mb();
+    return 0;
 }
 
 u32 bce_cmd_register_queue(struct bce_queue_cmdq *cmdq, struct bce_queue_memcfg *cfg, const char *name, bool isdirout)
@@ -285,7 +298,8 @@ u32 bce_cmd_register_queue(struct bce_queue_cmdq *cmdq, struct bce_queue_memcfg 
     cmd->addr = cfg->addr;
     cmd->length = cfg->length;
 
-    bce_cmd_finish(cmdq, &res);
+    if (bce_cmd_finish(cmdq, &res))
+        return (u32) -ETIMEDOUT;
     return res.status;
 }
 
@@ -298,7 +312,8 @@ u32 bce_cmd_unregister_memory_queue(struct bce_queue_cmdq *cmdq, u16 qid)
     cmd->cmd = BCE_CMD_UNREGISTER_MEMORY_QUEUE;
     cmd->flags = 0;
     cmd->qid = qid;
-    bce_cmd_finish(cmdq, &res);
+    if (bce_cmd_finish(cmdq, &res))
+        return (u32) -ETIMEDOUT;
     return res.status;
 }
 
@@ -311,7 +326,8 @@ u32 bce_cmd_flush_memory_queue(struct bce_queue_cmdq *cmdq, u16 qid)
     cmd->cmd = BCE_CMD_FLUSH_MEMORY_QUEUE;
     cmd->flags = 0;
     cmd->qid = qid;
-    bce_cmd_finish(cmdq, &res);
+    if (bce_cmd_finish(cmdq, &res))
+        return (u32) -ETIMEDOUT;
     return res.status;
 }
 

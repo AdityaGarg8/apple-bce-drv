@@ -2,11 +2,13 @@
 #include "../queue.h"
 #include "vhci.h"
 #include "../apple_bce.h"
+#include <linux/delay.h>
 #include <linux/usb/hcd.h>
 
 static void bce_vhci_transfer_queue_completion(struct bce_queue_sq *sq);
 static void bce_vhci_transfer_queue_giveback(struct bce_vhci_transfer_queue *q);
 static void bce_vhci_transfer_queue_remove_pending(struct bce_vhci_transfer_queue *q);
+static int bce_vhci_transfer_queue_wait_out_pending(struct bce_vhci_transfer_queue *q);
 
 static int bce_vhci_urb_init(struct bce_vhci_urb *vurb);
 static int bce_vhci_urb_update(struct bce_vhci_urb *urb, struct bce_vhci_message *msg);
@@ -181,6 +183,22 @@ static void bce_vhci_transfer_queue_completion(struct bce_queue_sq *sq)
     bce_vhci_transfer_queue_giveback(q);
 }
 
+static int bce_vhci_transfer_queue_wait_out_pending(struct bce_vhci_transfer_queue *q)
+{
+    unsigned long timeout = jiffies + msecs_to_jiffies(5000);
+    int pending;
+
+    while (atomic_read(&q->sq_out->available_commands) != q->sq_out->el_count - 1) {
+        if (time_after_eq(jiffies, timeout)) {
+            pending = (int) (q->sq_out->el_count - 1 - atomic_read(&q->sq_out->available_commands));
+            pr_err("bce-vhci: [%02x] timeout waiting for %d pending OUT requests\n", q->endp_addr, pending);
+            return -ETIMEDOUT;
+        }
+        usleep_range(1000, 2000);
+    }
+    return 0;
+}
+
 int bce_vhci_transfer_queue_do_pause(struct bce_vhci_transfer_queue *q)
 {
     unsigned long flags;
@@ -189,9 +207,8 @@ int bce_vhci_transfer_queue_do_pause(struct bce_vhci_transfer_queue *q)
     spin_lock_irqsave(&q->urb_lock, flags);
     q->active = false;
     spin_unlock_irqrestore(&q->urb_lock, flags);
-    if (q->sq_out) {
-        pr_err("bce-vhci: Not implemented: wait for pending output requests\n");
-    }
+    if (q->sq_out && (status = bce_vhci_transfer_queue_wait_out_pending(q)))
+        return status;
     bce_vhci_transfer_queue_remove_pending(q);
     if ((status = bce_vhci_cmd_endpoint_set_state(
             &q->vhci->cq, q->dev_addr, endp_addr, BCE_VHCI_ENDPOINT_PAUSED, &q->state)))

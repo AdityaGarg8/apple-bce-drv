@@ -37,6 +37,8 @@ struct bce_vhci_message_queue {
 typedef void (*bce_vhci_event_queue_callback)(struct bce_vhci_event_queue *q, struct bce_vhci_message *msg);
 struct bce_vhci_event_queue {
     struct bce_vhci *vhci;
+    const char *name;
+    bool active;
     struct bce_queue_sq *sq;
     struct bce_vhci_message *data;
     dma_addr_t dma_addr;
